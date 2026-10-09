@@ -1,0 +1,41 @@
+services:
+  php:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: laravel_wallet
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/var/www/laravel
+    working_dir: /var/www/laravel
+    restart: always
+    ports:
+      - "8010:8000"
+      - "8011:8001"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["/bin/sh", "-c", "composer install --no-interaction; grep -q "^APP_KEY=." .env || php artisan key:generate; php artisan migrate --force; php artisan serve --host=0.0.0.0 --port=8000"]
+
+  db:
+    image: postgres:16-alpine
+    container_name: laravel_wallet_db
+    restart: always
+    environment:
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+      POSTGRES_DB: wallet
+    ports:
+      - "127.0.0.1:54320:5432"
+    volumes:
+      - wallet_pg:/var/lib/postgresql/data
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+      - ./sql:/sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  wallet_pg:
