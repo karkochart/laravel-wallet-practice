@@ -8,6 +8,7 @@ use App\Exceptions\InvalidTransferException;
 use App\Models\Account;
 use App\Models\LedgerEntry;
 use App\Models\Transfer;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 
 class TransferService
@@ -33,71 +34,80 @@ class TransferService
                 'Amount must be a positive integer string',
             );
         }
-
-        return DB::transaction(function () use (
-            $fromAccountId,
-            $toAccountId,
-            $amount,
-            $idempotencyKey,
-        ) {
-            $accounts = $this->lockAccounts(
+        try {
+            $transfer = DB::transaction(function () use (
                 $fromAccountId,
                 $toAccountId,
-            );
-
-            /**
-             * @var Account $accountFrom
-             * @var Account $accountTo
-             */
-            $accountFrom = $accounts->get($fromAccountId);
-            $accountTo = $accounts->get($toAccountId);
-
-            if (!$accountFrom || !$accountTo) {
-                throw new InvalidTransferException('Account not found');
-            }
-            if ($accountFrom->currency !== $accountTo->currency) {
-                throw new InvalidTransferException(
-                    'Accounts have different currencies',
+                $amount,
+                $idempotencyKey,
+            ) {
+                $accounts = $this->lockAccounts(
+                    $fromAccountId,
+                    $toAccountId,
                 );
-            }
 
-            $existingTransfer = $this->findExistingTransfer(
+                /**
+                 * @var Account $accountFrom
+                 * @var Account $accountTo
+                 */
+                $accountFrom = $accounts->get($fromAccountId);
+                $accountTo = $accounts->get($toAccountId);
+
+                if (!$accountFrom || !$accountTo) {
+                    throw new InvalidTransferException('Account not found');
+                }
+                if ($accountFrom->currency !== $accountTo->currency) {
+                    throw new InvalidTransferException(
+                        'Accounts have different currencies',
+                    );
+                }
+
+                $existingTransfer = $this->findExistingTransfer(
+                    $idempotencyKey,
+                    $fromAccountId,
+                    $toAccountId,
+                    $amount,
+                );
+
+                if ($existingTransfer) {
+                    return $existingTransfer;
+                }
+
+                $idempotencyTransfer = $this->findIdempotencyConflict($idempotencyKey);
+                if ($idempotencyTransfer) {
+                    throw new IdempotencyConflictException();
+                }
+
+                if (bccomp($amount, $accountFrom->balance, 0) > 0) {
+                    throw new InsufficientFundsException();
+                }
+
+                $transfer = $this->createTransfer(
+                    $fromAccountId,
+                    $toAccountId,
+                    $amount,
+                    $idempotencyKey,
+                );
+
+                $this->applyBalances($accountFrom, $accountTo, $amount);
+
+                $this->createLedgerEntries($transfer, $accountFrom, $accountTo, $amount);
+
+                foreach ($accounts as $account) {
+                    $account->save();
+                }
+
+                return $transfer;
+            }, 5);
+        } catch (UniqueConstraintViolationException $e) {
+            $transfer = $this->findExistingTransfer(
                 $idempotencyKey,
                 $fromAccountId,
                 $toAccountId,
                 $amount,
-            );
-
-            if ($existingTransfer) {
-                return $existingTransfer;
-            }
-
-            $idempotencyTransfer = $this->findIdempotencyConflict($idempotencyKey);
-            if ($idempotencyTransfer) {
-                throw new IdempotencyConflictException();
-            }
-
-            if ($accountFrom->balance < $amount) {
-                throw new InsufficientFundsException();
-            }
-
-            $transfer = $this->createTransfer(
-                $fromAccountId,
-                $toAccountId,
-                $amount,
-                $idempotencyKey,
-            );
-
-            $this->applyBalances($accountFrom, $accountTo, $amount);
-
-            $this->createLedgerEntries($transfer, $accountFrom, $accountTo, $amount);
-
-            foreach ($accounts as $account) {
-                $account->save();
-            }
-
-            return $transfer;
-        }, 5);
+            ) ?? throw new IdempotencyConflictException();
+        }
+        return $transfer;
     }
 
     private function lockAccounts(int $fromId, int $toId)
